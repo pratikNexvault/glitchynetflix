@@ -1,0 +1,13 @@
+import requests
+
+url = "https://nftoken.site/v1/api.php"
+payload = {
+    "key": "NFK_e6f89ac62b838176e150d41f",
+    "cookie": "PASTE_YOUR_COOKIE_HERE"
+}
+
+try:
+    response = requests.post(url, json=payload)
+    print(response.json())
+except Exception as e:
+    print("Error:", e)
