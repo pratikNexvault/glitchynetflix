@@ -1,126 +1,167 @@
-// api/generate.js
+// pages/api/generate.js (or app/api/generate/route.js for App Router)
 
+// Configuration
 const EXTERNAL_API_URL = 'https://nftoken.site/v1/api.php';
-const API_KEY = 'NFK_e6f89ac62b838176e150d41f';
+const API_KEYS = [
+  'NFK_e6f89ac62b838176e150d41f',
+  // Add more keys here for rotation if you have them
+];
 const MAX_RETRIES = 3;
 const TIMEOUT_MS = 10000;
+const CONCURRENT_LIMIT = 5; // Max simultaneous requests
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Simple in-memory request counter (per instance - okay for serverless)
+let activeRequests = 0;
 
-function extractNetflixCookie(raw) {
-  if (!raw || typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
+// Helper: sleep
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Helper: robust cookie extraction (superpowered)
+function extractCookieValue(rawCookie) {
+  if (!rawCookie || typeof rawCookie !== 'string') return null;
+
+  let trimmed = rawCookie.trim();
+  if (!trimmed) return null;
+
+  // Try to find NetflixId using multiple patterns
   const patterns = [
-    /NetflixId=([^;]+)/i,
-    /"NetflixId"\s*:\s*"([^"]+)"/i,
-    /NetflixId\t([^\t\n]+)/,
-    /NetflixId\s*=\s*([^\s;]+)/,
+    /NetflixId=([^;]+)/i,                     // standard cookie string
+    /"NetflixId":"([^"]+)"/i,                 // JSON
+    /NetflixId\t([^\t\n]+)/,                  // Netscape format
+    /NetflixId\s*=\s*([^\s;]+)/,              // loose assignment
   ];
 
-  for (const p of patterns) {
-    const m = trimmed.match(p);
-    if (m?.[1]) {
-      try { return decodeURIComponent(m[1].trim()); } catch { return m[1].trim(); }
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match && match[1]) {
+      let value = match[1].trim();
+      // Decode URL-encoded values
+      try { value = decodeURIComponent(value); } catch(e) {}
+      return value;
     }
   }
 
+  // If no pattern matches, try to parse as JSON array
   try {
     const parsed = JSON.parse(trimmed);
     if (Array.isArray(parsed)) {
-      const obj = parsed.find(c => c.name === 'NetflixId');
-      return obj?.value || null;
+      const netflixIdObj = parsed.find(c => c.name === 'NetflixId');
+      if (netflixIdObj && netflixIdObj.value) return netflixIdObj.value;
+    } else if (parsed.NetflixId) {
+      return parsed.NetflixId;
     }
-    return parsed.NetflixId || null;
-  } catch { return null; }
+  } catch(e) {}
+
+  return null;
 }
 
-async function callWithRetry(cookie, attempt = 1) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-  try {
-    const res = await fetch(EXTERNAL_API_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ key: API_KEY, cookie }),
-      signal:  controller.signal,
-    });
-
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      const err = new Error(`External API responded with ${res.status}`);
-      err.type = 'NETWORK';
-      throw err;
-    }
-
-    const data = await res.json();
-
-    if (
-      data.expired === true ||
-      data.status  === false ||
-      (data.error && /expired|invalid/i.test(data.error))
-    ) {
-      throw Object.assign(new Error(data.error || 'Cookie expired or invalid.'), { type: 'EXPIRED' });
-    }
-
-    const tokenUrl = data.url || data.token || data.link;
-    if (!tokenUrl) throw new Error('API returned no token URL.');
-
-    let expires_ts;
-    if (data.expires_at)      expires_ts = data.expires_at;
-    else if (data.expires_in) expires_ts = Math.floor(Date.now() / 1000) + data.expires_in;
-    else                      expires_ts = Math.floor(Date.now() / 1000) + 6 * 3600;
-
-    return { url: tokenUrl, expires_ts, generated_at: Math.floor(Date.now() / 1000) };
-
-  } catch (err) {
-    clearTimeout(timer);
-
-    if (err.name === 'AbortError') {
-      throw Object.assign(new Error('Request timed out.'), { type: 'TIMEOUT' });
-    }
-
-    if (err.type === 'EXPIRED') throw err;
-
-    if (attempt < MAX_RETRIES) {
-      await sleep(Math.min(1000 * 2 ** attempt, 5000));
-      return callWithRetry(cookie, attempt + 1);
-    }
-
-    throw Object.assign(err, { type: err.type || 'NETWORK' });
-  }
-}
-
+// Main handler
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin',  '*');
+  // Enable CORS if needed
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST')
+  if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed.' });
+  }
 
-  const { cookie: rawCookie } = req.body || {};
-  if (!rawCookie || typeof rawCookie !== 'string')
-    return res.status(400).json({ error: 'Cookie is required.' });
+  // Rate limiting by concurrent requests (basic)
+  if (activeRequests >= CONCURRENT_LIMIT) {
+    return res.status(429).json({ error: 'Too many concurrent requests. Try again.' });
+  }
 
-  const netflixId = extractNetflixCookie(rawCookie);
-  if (!netflixId)
-    return res.status(400).json({ error: 'NetflixId not found in cookie.' });
+  const { cookie: raw_cookie } = req.body || {};
+  if (!raw_cookie || typeof raw_cookie !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid cookie.' });
+  }
+
+  // Extract NetflixId for quick validation
+  const netflixId = extractCookieValue(raw_cookie);
+  if (!netflixId) {
+    return res.status(400).json({ error: 'Could not find NetflixId in cookie data.' });
+  }
+
+  activeRequests++;
 
   try {
-    const result = await callWithRetry(rawCookie);
+    const result = await callExternalAPIWithRetry(raw_cookie);
     return res.status(200).json(result);
-
-  } catch (err) {
-    const map = {
-      EXPIRED: [200, { expired: true,  error: err.message }],
-      TIMEOUT: [504, { error: 'Request timed out. Retry karo.' }],
-      NETWORK: [502, { error: 'Token service unreachable.' }],
-    };
-    const [status, body] = map[err.type] || [500, { error: err.message || 'Internal error.' }];
-    return res.status(status).json(body);
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] API error:`, error.message);
+    // Classify error for client
+    if (error.type === 'EXPIRED') {
+      return res.status(200).json({ expired: true, error: error.message });
+    }
+    if (error.type === 'NETWORK') {
+      return res.status(502).json({ error: 'Token service unreachable.' });
+    }
+    if (error.type === 'TIMEOUT') {
+      return res.status(504).json({ error: 'Request timed out.' });
+    }
+    return res.status(500).json({ error: error.message || 'Internal server error.' });
+  } finally {
+    activeRequests--;
   }
 }
+
+// Call external API with retries and rotation
+async function callExternalAPIWithRetry(cookie, attempt = 1) {
+  const key = API_KEYS[(attempt - 1) % API_KEYS.length]; // rotate on each retry
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(EXTERNAL_API_URL, {
+
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, cookie }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    const data = await response.json();
+
+    // Check if the external API indicates expired/invalid cookie
+    if (data.expired === true || (data.error && data.error.toLowerCase().includes('expired'))) {
+      const err = new Error(data.error || 'Cookie expired or invalid.');
+      err.type = 'EXPIRED';
+      throw err;
+    }
+
+    // Validate that we got a token/URL
+    if (!data.url && !data.token) {
+      throw new Error('External API returned success but no token or URL.');
+    }
+
+    // Add a timestamp for client convenience
+    data.generated_at = Math.floor(Date.now() / 1000);
+
+    return data;
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if (error.name === 'AbortError') {
+      const err = new Error('Request timeout');
+      err.type = 'TIMEOUT';
+      throw err;
+    }
+
+    // Retry on network errors or 5xx responses
+    if (attempt < MAX_RETRIES && (error.cause?.code === 'ECONNRESET' || error.message.includes('fetch'))) {
+      const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+      await sleep(delay);
+      return callExternalAPIWithRetry(cookie, attempt + 1);
+    }
+
+    // Otherwise, rethrow with type NETWORK
+    const err = new Error(error.message);
+    err.type = 'NETWORK';
+    throw err;
+  }
+}
+Show quoted text
